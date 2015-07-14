@@ -68,7 +68,18 @@ my %metric_types = (
     'ifHCOutBroadcastPkts'  => 'Counter64',
     'ifOutErrors'           => 'Counter32',
     'ifOutDiscards'         => 'Counter32',
+    'ifOperStatus'          => 'INTEGER',
 );
+
+my $ifOperStatus = {
+    1 => 'up',
+    2 => 'down',
+    3 => 'testing',
+    4 => 'unknown',
+    5 => 'dormant',
+    6 => 'notPresent',
+    7 => 'lowerLayerDown',
+};
 
 my $vars = [];
 foreach my $oid (sort keys %metric_types) {
@@ -120,14 +131,26 @@ foreach my $comm (keys %{$polled}) {
     my $resp = $sm->execute() or $logger->logdie("Execute: $SNMP::Multi::error");
 
     foreach my $host ($resp->hosts()) {
-
         my $int_data = [];
-
         foreach my $result ($host->results()) {
             if ($result->error()) {
                 $logger->error("Error with $host: ", $result->error());
                 next;
             }
+            my $hostname = $polled->{$comm}->{$host}->{'hostname'};
+            # more sanitization if your device hostnames have dots in them
+            $hostname =~ s/\./-/g;
+            # if you wanted to customize your graphite metric paths based on your
+            # device hostnames or whatever else, you can do it here
+            # consider the next 8 lines to be a working example. :-)
+            my @hostparts = split(/-/, $hostname);
+            my $house = $hostparts[0];
+            my $prefix = "snmp.$house";
+            if ($hostname =~ m/-gw/) {
+                $prefix = "snmp.core";
+            }
+
+            my $oper = {}; 
 
             foreach my $varlist ($result->varlists()) {
                 foreach my $v (@$varlist) {
@@ -137,21 +160,17 @@ foreach my $comm (keys %{$polled}) {
                     my $ifname = $polled->{$comm}->{$host}->{'interfaces'}->{@$v[1]}->{'ifName'};
                     # no slashes allowed in graphite metric names/paths
                     $ifname =~ s/\//-/g;
-                    my $hostname = $polled->{$comm}->{$host}->{'hostname'};
-                    # more sanitization if your device hostnames have dots in them
-                    $hostname =~ s/\./-/g;
-                    # if you wanted to customize your graphite metric paths based on your
-                    # device hostnames or whatever else, you can do it here
-                    # consider the next 8 lines to be a working example. :-)
-                    my @hostparts = split(/-/, $hostname);
-                    my $dc = $hostparts[0];
-                    if ($hostname =~ m/-COR-/) {
-                        push @{$int_data}, ["snmp.$dc.core.$hostname.$ifname.@$v[0].count", [$start_time, @$v[2]]];
+
+                    # Handle ifOperStatus separately
+                    if (@$v[0] eq 'ifOperStatus'){
+                        $oper->{$ifOperStatus->{@$v[2]}}++;
+                        next;
                     }
-                    if ($hostname =~ m/-EDG-/) {
-                        push @{$int_data}, ["snmp.$dc.edge.$hostname.$ifname.@$v[0].count", [$start_time, @$v[2]]];
-                    }
+                    push @{$int_data}, ["$prefix.$hostname.if.$ifname.@$v[0].count", [$start_time, @$v[2]]];
                 }
+            }
+            foreach my $o (keys %$oper){
+                push @{$int_data}, ["$prefix.$hostname.ifOperStatus.$o.count", [$start_time, $oper->{$o}]];
             }
         }
 
