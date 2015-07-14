@@ -24,30 +24,26 @@
 
 use strict;
 use warnings;
+use Switch;
 use SNMP;
 use SNMP::Multi;
 use YAML qw/LoadFile DumpFile/;
+use Data::Dumper;
 
 &SNMP::loadModules('ALL');
 &SNMP::initMib();
 
-my $devices = LoadFile('/path/to/devices/spec.yaml');
-my $polled_fn = "polling.yaml";
-
+my $devices = LoadFile('conf/devices.yaml');
+my $polled_fn = "conf/polling.yaml";
 my %polled = ();
+
+get_vendor($devices);
 
 foreach my $device (sort(keys %{$devices})) {
     $polled{$devices->{$device}->{'snmp'}}->{$devices->{$device}->{'mgmt'}}->{'hostname'} = $device;
-    my $v = get_vendor($devices->{$device}->{'mgmt'}, $devices->{$device}->{'snmp'});
+#    my $v = get_vendor($devices->{$device}->{'mgmt'}, $devices->{$device}->{'snmp'});
     my $types = get_types($devices->{$device}->{'mgmt'}, $devices->{$device}->{'snmp'});
     $polled{$devices->{$device}->{'snmp'}}->{$devices->{$device}->{'mgmt'}}->{'interfaces'} = get_names($types, $devices->{$device}->{'snmp'});
-    # figured it might be useful to get vendor info
-    if ($v =~ m/ironware/i) {
-        $polled{$devices->{$device}->{'snmp'}}->{$devices->{$device}->{'mgmt'}}->{'vendor'} = 'Brocade'
-    }
-    if ($v =~ m/cisco/i) {
-        $polled{$devices->{$device}->{'snmp'}}->{$devices->{$device}->{'mgmt'}}->{'vendor'} = 'Cisco'
-    }
 }
 
 DumpFile($polled_fn, \%polled);
@@ -103,7 +99,7 @@ sub get_types {
     my @names;
     push @names, [ 'sysUpTime' ];
     foreach my $i (@indexes) {
-        push @names, [ "IF-MIB::ifName." . $i ];
+        push @names, [ "IF-MIB::ifName." . $i ], [ "IF-MIB::ifAlias." . $i ];
     }
 
     my $req_names = SNMP::Multi::VarReq->new (
@@ -112,7 +108,6 @@ sub get_types {
         vars => [ @names ],
     );
     die "VarReq: $SNMP::Multi::VarReq::error\n" unless $req_names;
-
     return $req_names;
 }
 
@@ -148,7 +143,9 @@ sub get_names {
             foreach my $varlist ($result->varlists()) {
                 foreach my $v (@$varlist) {
                     if (@$v[0] eq '1.3.6.1.2.1.31.1.1.1.1') {
-                       $response{@$v[1]}->{'ifName'} = @$v[2]
+                        $response{@$v[1]}->{'ifName'} = @$v[2];
+                    }elsif (@$v[0] eq '1.3.6.1.2.1.31.1.1.1.18'){
+                        $response{@$v[1]}->{'ifAlias'} = @$v[2];
                     }
                 }
             }
@@ -159,49 +156,60 @@ sub get_names {
 }
 
 sub get_vendor {
-    # get vendor of device
-    my ($polled, $comm) = @_;
-    my $req = SNMP::Multi::VarReq->new (
-        nonrepeaters => 1,
-        hosts => [ $polled ],
-        # for snmpget (vs snmpbulkwalk), the fully
-        # qualified MIB object is required
-        vars => [ [ 'sysUpTime' ], [ 'SNMPv2-MIB::sysDescr.0' ] ],
-    );
-    die "VarReq: $SNMP::Multi::VarReq::error\n" unless $req;
+    my $community = {};
+    for my $d (keys %$devices){
+        push @{$community->{$devices->{$d}->{'snmp'}}}, $devices->{$d};
+    }
 
-    my $sm = SNMP::Multi->new (
-        Method      => 'get',
-        MaxSessions => 32,
-        PduPacking  => 16,
-        Community   => $comm,
-        Version     => '2c',
-        Timeout     => 5,
-        Retries     => 3,
-        UseNumeric  => 1,
-    )
-    or die "$SNMP::Multi::error\n";
+    for my $c (keys %$community){
+        my @hosts = map { $_->{'mgmt'} } @{$community->{$c}};
+        my $req = SNMP::Multi::VarReq->new (
+            nonrepeaters => 1,
+            hosts => \@hosts,
+            # for snmpget (vs snmpbulkwalk), the fully
+            # qualified MIB object is required
+            vars => [ [ 'sysUpTime' ], [ 'SNMPv2-MIB::sysDescr.0' ] ],
+        );
+        die "VarReq: $SNMP::Multi::VarReq::error\n" unless $req;
+        my $sm = SNMP::Multi->new (
+            Method      => 'get',
+            MaxSessions => 32,
+            PduPacking  => 16,
+            Community   => $c,
+            Version     => '2c',
+            Timeout     => 5,
+            Retries     => 3,
+            UseNumeric  => 1,
+        )
+        or die "$SNMP::Multi::error\n";
+        $sm->request($req) or die $sm->error;
+        my $resp = $sm->execute() or die "Execute: $SNMP::Multi::error\n";
 
-    my $vendor = undef;
+        foreach my $host ($resp->hosts()) {
+            foreach my $result ($host->results()) {
+                if ($result->error()) {
+                    print "Error with $host: ", $result->error();
+                    next;
+                }
 
-    $sm->request($req) or die $sm->error;
-    my $resp = $sm->execute() or die "Execute: $SNMP::Multi::error\n";
-
-    foreach my $host ($resp->hosts()) {
-        foreach my $result ($host->results()) {
-            if ($result->error()) {
-                print "Error with $host: ", $result->error();
-                next;
-            }
-
-            foreach my $varlist ($result->varlists()) {
-                foreach my $v (@$varlist) {
-                    next if @$v[0] eq '1.3.6.1.2.1.1.3';
-                    $vendor = @$v[2]
+                foreach my $varlist ($result->varlists()) {
+                    foreach my $v (@$varlist) {
+                        next if @$v[0] eq '1.3.6.1.2.1.1.3';
+                        my $vendor = @$v[2];
+                        $polled{$c}->{$host}->{'vendor'} = $vendor;
+                    }
                 }
             }
         }
     }
+}
 
-    return $vendor;
+sub gettemperatures {
+    for my $community (keys %polled){
+        my $c = $polled{$community}
+        # Cisco devices...
+        #for my $d (grep { $_->{'vendor'} =~ m/cisco/i } @$c){
+
+        #}
+    }
 }
